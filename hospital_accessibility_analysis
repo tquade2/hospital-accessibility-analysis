@@ -1,0 +1,233 @@
+# Load libraries
+library(sf)
+library(tidyverse)
+library(tmap)
+library(tidycensus)
+library(tigris)
+library(rmapshaper)
+library(matrixStats)
+library(SpatialAcc)
+library(truncnorm)
+
+setwd("C:\\Users\\tayqu\\My Drive\\School\\01 Current Semester\\R\\04 Assignments\\assignment 5")
+
+#Part 1: Accessibility to hospitals at census tract level
+
+# Census tract data for Columbus
+
+census_api_key("cfeccec66316dab67e8ad022f05799d316f56491")
+
+tracts <- get_acs(geography = "tract", 
+                  year = 2019,
+                  state = "OH",
+                  survey = "acs5",
+                  output = "wide",
+                  geometry = T,
+                  variables = c(population = "B01003_001",
+                                pop_18_over = "B03002_001", 
+                                white = "B03002_003",
+                                black = "B03002_004",
+                                asian = "B03002_006",
+                                hispanic = "B03002_012",
+                                median_income = "B19013_001"))
+
+#Calculate percent race/ethnicity, remove variables
+tracts <- tracts %>%
+            mutate(pct_white = white/pop_18_over,
+                   pct_asian = asian/pop_18_over, 
+                   pct_black = black/pop_18_over,
+                   pct_hispanic = hispanic/pop_18_over) %>%
+            rename(population = population, median_income = median_income) %>%
+            dplyr::select(c(GEOID,population, pct_white, pct_asian, pct_black, pct_hispanic, median_income))
+
+
+# Download Ohio cbus.boundary and filter Columbus
+
+ohio <- places(state = 39) %>% filter(GEOID == "3918000")
+cbus.boundary <- filter(ohio, NAME == "Columbus")
+
+# Check projections
+
+tracts <- st_as_sf(tracts)
+crs <- "EPSG:26917"
+tracts <- st_transform(tracts, crs = crs)
+cbus.boundary <- st_transform(cbus.boundary, crs = crs)
+
+# Clip tracts with cbus.boundary
+
+cbus <- ms_clip(target = tracts, clip = cbus.boundary, remove_slivers = T)
+cbus <- st_transform(cbus, crs = crs)
+
+# Hospital data for Columbus
+
+hospitals <- st_read("C:\\Users\\tayqu\\My Drive\\School\\01 Current Semester\\R\\04 Assignments\\assignment 5\\medical_facilities\\Medical_Facilities.shp")
+
+# Filter hospitals/medical centers/clinics
+
+hospitals <- hospitals[hospitals$POI_TYPE %in% c("Medical - Hospital/Medical Center", "Medical - Clinic"),]
+hospitals <- st_transform(hospitals, crs = crs)
+hospitals <- st_intersection(hospitals, cbus)
+
+# Plot tracts and hospitals together
+
+tm_shape(cbus) +
+  tm_polygons() +
+  tm_shape(hospitals) +
+  tm_dots(.07, col = "red") + 
+  tm_layout(main.title = "Hospitals, Medical Centers, and Clinics in Columbus, OH",
+            main.title.size = .9,
+            frame = F) 
+
+# Generate tract centroids and create buffers of radius 3000m around each neighborhood
+centroids <- st_centroid(cbus)
+buffers <- st_buffer(centroids, 3000)
+
+# Count hospitals in each buffer and calculate hospitals per 10000 people
+hosp.in.buf <- st_join(buffers, hospitals) %>%
+  group_by(GEOID.x) %>%
+  mutate("nhospitals" = n()) %>%
+  filter(!is.na(POI_TYPE)) %>%
+  st_drop_geometry() %>%
+  left_join(., as.data.frame(st_drop_geometry(hosp.in.buf[, c("GEOID.x", "nhospitals", "tpop.x")]) %>%
+                              mutate(hpp = (nhospitals/tpop.x)*10000), by = "GEOID.x")
+
+# Join the buffer layer with the tract layer and make a choropleth map
+cbus <- left_join(cbus, hosp.in.buf, c("GEOID" = "GEOID.x"))
+tm_shape(cbus) +
+  tm_polygons(col = "hpp", style = "jenks", palette = "Reds", border.alpha = 0, title = "Hospitals per 10k persons") +
+  tm_layout(main.title = "Hospital Accessibility (Buffers), Columbus, OH",
+            frame = F, legend.outside = T, legend.outside.position = "left")
+
+# Part 3: Distance to the nearest hospitals
+
+# Measure distance from centroid to each hospital
+distances <- as.data.frame(st_distance(centroids, hospitals))
+
+# Check dimension
+dim(centroids)
+dim(hospitals)
+dim(distances)
+dim(cbus)
+
+# Add minimum distance as a new column in the `cbus` dataframe
+cbus <- mutate(cbus, dist = rowMins(as.matrix(distances)))
+
+# Create a choropleth map of nearest hospital distance at the census tract level
+tm_shape(cbus) +
+  tm_polygons(col = "dist",
+              style = "jenks",
+              palette = "Greens",
+              border.alpha = 0,
+              title = "Hospitals per 10k persons") +
+  tm_layout(main.title = "Hospital Accessibility (Distances), Columbus, OH",
+            frame = F,
+            legend.outside = T,
+            legend.outside.position = "left")
+
+# Part 4: Floating catchment area
+
+# Select tpop from centroid
+pop <- dplyr::select(centroids, tpop)
+cb <- st_join(pop, buffers)
+
+# Aggregate sum of tpop
+cb.ag <- aggregate(tpop.y ~ GEOID, cb, sum)
+
+# Join aggregate tpop to the tract buffer layer
+b.a <- left_join(buffers, cb.ag)
+b.a <- rename(b.a, cpop = "tpop.y")
+b.a <- as.data.frame(st_drop_geometry(b.a))
+b.a <- left_join(cbus, b.a, by = "GEOID")
+b.a$fca <- (b.a$nhospitals.x/b.a$cpop) * 10000
+
+# Create a choropleth map of floating catchment area
+tm_shape(b.a) +
+  tm_polygons(col = "fca",
+              style = "jenks",
+              palette = "Blues",
+              border.alpha = 0,
+              title = "Hospitals per 10k (Catchments) People") +
+  tm_layout(main.title = "Hospital Accessibility, Columbus, OH",
+            frame = F,
+            legend.outside = T,
+            legend.outside.position = "left")
+
+
+#Part 5: Two-step floating catchment area
+
+cent.coords <- st_coordinates(centroids)
+hosp.coords <- st_coordinates(hospitals)
+cent.hosp.dist <- distance(cent.coords,hosp.coords)
+set.seed(5229)
+x <- rtruncnorm(nrow(hospitals), a=120, b=2000, mean=800, sd=300)  # 90 hospitals, min 120, max 2000 beds.
+x <- round(x, digits = 0) # Round the data to the nearest integers 
+hist(x, breaks=nrow(hospitals)) # Plot to see the data distribution
+x <- data.frame(x)
+colnames(x) <- "capacity" # make a column label
+hospitals <- cbind(hospitals, x) # bind x to the original hospital layer
+
+TSFCA <- ac(p = b.a$cpop, 
+            n = hospitals$capacity, 
+            D = cent.hosp.dist, d0 = 3000, family = "2SFCA")
+
+b.a <- b.a %>%
+       mutate(TSFCA = TSFCA)
+
+tm_shape(b.a) +
+         tm_polygons(col = "TSFCA",
+                     style = "jenks",
+                     palette = "Purples", 
+                     border.alpha = 0,
+                     title = "Hospitals per 10k People") +
+         tm_layout(main.title = "Hospital Accessibility (TSFCA), Columbus, OH",
+                   frame = F,
+                   legend.outside = T,
+                   legend.outside.position = "left")
+                   
+#white
+tm_shape(b.a) +
+         tm_polygons(col = "pnhwhite.x",
+                     style = "jenks",
+                     palette = "Oranges", 
+                     border.alpha = 0,
+                     title = "Hospitals per 10k People") +
+         tm_layout(main.title = "Hospital Accessibility (White), Columbus, OH",
+                   frame = F,
+                   legend.outside = T,
+                   legend.outside.position = "left")
+
+#black
+tm_shape(b.a) +
+         tm_polygons(col = "pnhblk.x",
+                     style = "jenks",
+                     palette = "Oranges", 
+                     border.alpha = 0,
+                     title = "Hospitals per 10k People") +
+         tm_layout(main.title = "Hospital Accessibility (Black), Columbus, OH",
+                   frame = F,
+                   legend.outside = T,
+                   legend.outside.position = "left")
+
+#asian
+tm_shape(b.a) +
+         tm_polygons(col = "pnhasn.x",
+                     style = "jenks",
+                     palette = "Oranges", 
+                     border.alpha = 0,
+                     title = "Hospitals per 10k People") +
+         tm_layout(main.title = "Hospital Accessibility (Asian), Columbus, OH",
+                   frame = F,
+                   legend.outside = T,
+                   legend.outside.position = "left")
+
+#hispanic
+tm_shape(b.a) +
+         tm_polygons(col = "phisp.x",
+                     style = "jenks",
+                     palette = "Oranges", 
+                     border.alpha = 0,
+                     title = "Hospitals per 10k People") +
+         tm_layout(main.title = "Hospital Accessibility (Hispanic), Columbus, OH",
+                   frame = F,
+                   legend.outside = T,
+                   legend.outside.position = "left")
